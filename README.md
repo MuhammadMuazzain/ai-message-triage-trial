@@ -121,7 +121,7 @@ Fields are absent where it would not be realistic (system skips, generic amenity
 pytest -q
 ```
 
-28 tests total. The original 5 client tests are untouched. 23 new tests were added covering:
+29 tests total. The original 5 client tests are untouched. 24 new tests were added covering:
 
 - Urgency detection from subject line alone (`No heat` in subject, calm body)
 - Maintenance routing fires before money routing when both terms are present
@@ -138,6 +138,7 @@ pytest -q
 - Fix 3: `--report` mode produces no `INFO` log lines in stdout or stderr
 - `reviewer_summary` contains correct urgency/sender for high-urgency maintenance message
 - `reviewer_summary` reports no contact info for low-urgency leasing inquiry
+- `reviewer_summary` shows "No callback on file" (not the full fallback) when unit is present but callback is absent
 
 **Review fixes applied (Second task):**
 
@@ -147,11 +148,11 @@ Bare substring `in` checks inside `_detect_requested_action()` caused words like
 
 **Fix 2 - Urgency false positives on routine leasing phrases (`src/triage/core.py`)**
 
-`"today"` and `"now"` in `_URGENCY_HIGH` were firing unconditionally, so `"can I tour today?"` was classified `urgency=high`. Split `_URGENCY_HIGH` into two tiers: `_URGENCY_HIGH_ALWAYS` (inherently alarming terms like `"flood"`, `"emergency"`, `"no heat"` - always high regardless of context) and `_URGENCY_HIGH_CONDITIONAL` (`"today"`, `"now"` — only high when the message category is not `leasing_general`). The original `_URGENCY_HIGH` tuple is preserved as a combined constant so nothing else breaks. `_detect_urgency()` gains an optional `category` parameter; the call site in `_extract()` passes it through.
+`"today"` and `"now"` in `_URGENCY_HIGH` were firing unconditionally, so `"can I tour today?"` was classified `urgency=high`. Split `_URGENCY_HIGH` into two tiers: `_URGENCY_HIGH_ALWAYS` (inherently alarming terms like `"flood"`, `"emergency"`, `"no heat"` - always high regardless of context) and `_URGENCY_HIGH_CONDITIONAL` (`"today"`, `"now"` - only high when the message category is not `leasing_general`). The original `_URGENCY_HIGH` tuple is preserved as a combined constant so nothing else breaks. `_detect_urgency()` gains an optional `category` parameter; the call site in `_extract()` passes it through.
 
-**Fix 3 - INFO logs cluttering `--report` output (`src/triage/runner.py`)**
+**Fix 3 - INFO logs cluttering output (`src/triage/runner.py`)**
 
-`basicConfig` sets the root logger to `INFO`, so routing events from `core.py` (`routed_to_human_review`, `routed_to_auto_draft`, etc.) were printing interleaved with the human-readable report. When `--report` is detected, the root logger level is immediately raised to `WARNING`. This keeps the report output clean while still surfacing `WARNING` (skipped malformed lines) and `ERROR` (unexpected triage failures) events that the operator genuinely needs to see.
+Two-part fix. First, `basicConfig` now sets `stream=sys.stderr` explicitly, so all log output is directed to stderr regardless of mode. This keeps stdout clean for JSON lines that callers may be piping or parsing - the root issue behind INFO events mixing with JSON output. Second, when `--report` is detected the root logger level is raised to `WARNING`, which suppresses INFO routing events entirely so they do not interleave with the human-readable report. WARNING and ERROR events still reach stderr in both modes.
 
 **Evaluation report (observability command):**
 
