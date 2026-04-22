@@ -1,0 +1,32 @@
+# virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# build / egg info
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# pytest cache
+.pytest_cache/
+
+# logs
+*.txt
+!README.md
+
+# editor
+.vscode/
+.idea/
+*.swp
+
+# private / trial notes — do not expose Upwork conversation
+requirments_client.txt
+logs.txt
