@@ -425,5 +425,28 @@ def test_reviewer_summary_low_urgency_leasing():
     assert summary, "reviewer_summary must not be empty"
     assert "Low" in summary
     assert "prospect" in summary
-    # No unit or callback in this message
+    # No unit or callback in this message - full fallback phrase applies
     assert "No unit or callback on file" in summary
+
+
+def test_reviewer_summary_unit_present_no_callback():
+    """When a unit mention is extracted but no callback number is present, the
+    summary must include the unit reference and say 'No callback on file' -
+    NOT 'No unit or callback on file', which would be contradictory.
+
+    This covers the msg_018 scenario: 'Unit 4B on Oak Avenue' is extracted as
+    the unit mention but no phone number appears in the message.
+    """
+    result = triage_message({
+        "sender": "prospect@example.com",
+        "subject": "Unit 4B on Oak Avenue",
+        "body": "I saw the listing for Unit 4B on Oak Avenue. Is it still available?",
+    })
+    summary = result.extraction.reviewer_summary
+    assert summary, "reviewer_summary must not be empty"
+    # Unit mention must be in the summary
+    assert "4B" in summary or "Oak Avenue" in summary
+    # Must NOT say the contradictory full fallback when a unit is present
+    assert "No unit or callback on file" not in summary
+    # Must say the correct partial fallback
+    assert "No callback on file" in summary

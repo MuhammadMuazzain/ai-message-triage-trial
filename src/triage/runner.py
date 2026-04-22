@@ -19,11 +19,11 @@
 #    distribution, unit-mention extraction hit rate, and a safety check
 #    for high-urgency messages that routed to auto_draft.
 #
-# 6. (fix 3) In --report mode the root logger level is raised to WARNING so
-#    INFO routing logs (routed_to_human_review, routed_to_auto_draft, etc.)
-#    do not clutter the human-readable report. WARNING and ERROR events
-#    (bad JSON lines, unexpected triage failures) still print because those
-#    signal real problems the operator needs to see even during a report run.
+# 6. (fix 3) basicConfig now sets stream=sys.stderr so ALL log output goes to
+#    stderr, keeping stdout clean for JSON lines that callers may be piping or
+#    parsing. Additionally, in --report mode the root logger level is raised to
+#    WARNING so INFO routing events do not interleave with the human-readable
+#    report. WARNING and ERROR events still reach stderr in both modes.
 # =============================================================================
 
 from __future__ import annotations
@@ -37,7 +37,11 @@ from pathlib import Path
 from .core import triage_message
 
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+# --- NEW (fix 3): stream=sys.stderr keeps INFO routing logs off stdout so they
+# do not interleave with the JSON output that callers may be piping/parsing.
+# In --report mode the root logger is additionally raised to WARNING (line ~66)
+# to suppress INFO events from the report output entirely.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
 logger = logging.getLogger(__name__)
 
 

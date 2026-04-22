@@ -283,10 +283,18 @@ def _build_reviewer_summary(
       "Low-urgency prospect leasing_general request. No unit or callback on file."
     """
     unit_part = f" for {unit_mention}" if unit_mention else ""
-    cb_part = f"Callback: {callback_number}." if callback_number else "No unit or callback on file."
+    # Only append the fallback when BOTH unit and callback are absent.
+    # If either is present the reviewer already has a reference point and the
+    # "No unit or callback on file" phrase would be contradictory.
+    if callback_number:
+        tail = f"Callback: {callback_number}."
+    elif unit_mention:
+        tail = "No callback on file."
+    else:
+        tail = "No unit or callback on file."
     return (
         f"{urgency.capitalize()}-urgency {sender_type} {category} "
-        f"request{unit_part}. {cb_part}"
+        f"request{unit_part}. {tail}"
     )
 # --- END NEW ---
 
