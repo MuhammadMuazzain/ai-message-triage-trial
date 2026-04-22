@@ -87,7 +87,7 @@ We will score:
 
 A property manager looking at a triage queue gets no actionable information from `route=human_review` alone. They still have to open each email to find out who sent it, how urgent it is, what the person wants, and which unit it concerns. This improvement adds a structured `Extraction` object to every `TriageResult` that answers those questions without opening the email.
 
-Every message, regardless of route, now produces all six fields from Isaac's extraction spec:
+Every message, regardless of route, now produces all six fields from Isaac's extraction spec plus one additional product improvement field:
 
 | Field | Values | Purpose |
 |---|---|---|
@@ -97,6 +97,7 @@ Every message, regardless of route, now produces all six fields from Isaac's ext
 | `unit_mention` | Street name, unit code, or `None` | Extracted property reference for record lookup |
 | `callback_number` | Phone number string, or `None` | Extracted from body so reviewer can call back without opening the email |
 | `property_name` | Building/complex name, or `None` | Extracted Title-Case noun phrase followed by a property-type word (Apartments, Condos, Residences, etc.) |
+| `reviewer_summary` | Plain-English string | One-sentence summary assembled from the extracted fields for the human review queue, e.g. `"High-urgency tenant maintenance request for unit 2A. Callback: (555) 308-1247."` |
 
 I chose this over the other four options because it adds value to the existing routing without touching the routing logic at all, purely additive and safe. It also makes the `human_review` queue directly actionable.
 
@@ -120,7 +121,7 @@ Fields are absent where it would not be realistic (system skips, generic amenity
 pytest -q
 ```
 
-21 tests total. The original 5 client tests are untouched. 16 new tests were added covering:
+28 tests total. The original 5 client tests are untouched. 23 new tests were added covering:
 
 - Urgency detection from subject line alone (`No heat` in subject, calm body)
 - Maintenance routing fires before money routing when both terms are present
@@ -132,6 +133,25 @@ pytest -q
 - Non-dict input (`None`, string) fails closed to `human_review` without crashing
 - Whitespace-only sender treated as invalid, fails closed to `human_review`
 - Every route returns a proper `Extraction` object, never `None`
+- Fix 1: `"please"` does not trigger lease action, `"unavailable"` does not trigger tour action
+- Fix 2: `"tour today"` is not high urgency; `"today"` still fires high urgency in maintenance context
+- Fix 3: `--report` mode produces no `INFO` log lines in stdout or stderr
+- `reviewer_summary` contains correct urgency/sender for high-urgency maintenance message
+- `reviewer_summary` reports no contact info for low-urgency leasing inquiry
+
+**Review fixes applied (Second task):**
+
+**Fix 1 - `requested_action` false keyword matches (`src/triage/core.py`)**
+
+Bare substring `in` checks inside `_detect_requested_action()` caused words like `"please"` to match `"lease"` and `"unavailable"` to match `"available"`. Added a `_kw_match()` helper that uses `\b` word-boundary regex (consistent with how `_contains_any()` and `_detect_urgency()` already work) and replaced all four `any(kw in text ...)` calls with it. No keyword lists or routing logic changed.
+
+**Fix 2 - Urgency false positives on routine leasing phrases (`src/triage/core.py`)**
+
+`"today"` and `"now"` in `_URGENCY_HIGH` were firing unconditionally, so `"can I tour today?"` was classified `urgency=high`. Split `_URGENCY_HIGH` into two tiers: `_URGENCY_HIGH_ALWAYS` (inherently alarming terms like `"flood"`, `"emergency"`, `"no heat"` - always high regardless of context) and `_URGENCY_HIGH_CONDITIONAL` (`"today"`, `"now"` — only high when the message category is not `leasing_general`). The original `_URGENCY_HIGH` tuple is preserved as a combined constant so nothing else breaks. `_detect_urgency()` gains an optional `category` parameter; the call site in `_extract()` passes it through.
+
+**Fix 3 - INFO logs cluttering `--report` output (`src/triage/runner.py`)**
+
+`basicConfig` sets the root logger to `INFO`, so routing events from `core.py` (`routed_to_human_review`, `routed_to_auto_draft`, etc.) were printing interleaved with the human-readable report. When `--report` is detected, the root logger level is immediately raised to `WARNING`. This keeps the report output clean while still surfacing `WARNING` (skipped malformed lines) and `ERROR` (unexpected triage failures) events that the operator genuinely needs to see.
 
 **Evaluation report (observability command):**
 
@@ -180,7 +200,29 @@ The safety check at the bottom is the key signal for operations: if any message 
 python -m triage.runner data/sample_messages.jsonl
 ```
 
-Outputs one JSON line per message including route, category, confidence, warnings, and all six extraction fields. Final line: `{"accuracy": 1.0, "correct": 40, "total": 40}`.
+Outputs one JSON line per message including route, category, confidence, warnings, and all seven extraction fields (including `reviewer_summary`). Final line: `{"accuracy": 1.0, "correct": 40, "total": 40}`.
+
+**Viewing INFO logs (standard mode only):**
+
+INFO routing logs are visible by default in standard mode. Each processed message prints a routing event to stderr alongside the JSON output on stdout. To see them separated clearly, redirect stdout to a file and watch stderr in the terminal:
+
+```bash
+python -m triage.runner data/sample_messages.jsonl > output.json
+```
+
+Or pipe stdout to a file and leave stderr printing to the terminal:
+
+```bash
+python -m triage.runner data/sample_messages.jsonl 1>output.json
+```
+
+To also capture DEBUG-level logs (one `triage_start` event per message), set the log level explicitly before running:
+
+```bash
+python -c "import logging; logging.basicConfig(level=logging.DEBUG); from triage.runner import main; main()" data/sample_messages.jsonl
+```
+
+In `--report` mode, INFO logs are intentionally suppressed (Fix 3) so the report output is clean. WARNING and ERROR events still print to stderr in both modes.
 
 ---
 

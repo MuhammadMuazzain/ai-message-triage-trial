@@ -269,3 +269,161 @@ def test_auto_draft_body_never_fabricates_facts():
         assert fabricated_claim not in body_lower, (
             f"Draft body fabricated a claim: found '{fabricated_claim}'"
         )
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: whole-word keyword matching in _detect_requested_action
+# ---------------------------------------------------------------------------
+
+def test_requested_action_please_does_not_trigger_lease():
+    """'please' contains 'lease' as a substring.
+
+    Before the fix, bare `in` matching caused "please confirm payment" to
+    return 'ask about lease term renewal or dates'. After the fix, \b word
+    boundaries ensure only the complete word 'lease' fires the lease branch.
+    """
+    result = triage_message({
+        "sender": "vendor@example.com",
+        "subject": "Payment",
+        "body": "Please confirm payment has been sent.",
+    })
+    # Must not match the lease branch due to 'please' containing 'lease'
+    assert result.extraction.requested_action != "ask about lease term renewal or dates"
+
+
+def test_requested_action_unavailable_does_not_trigger_tour():
+    """'unavailable' contains 'available' as a substring.
+
+    Before the fix, a message saying the unit is 'unavailable' would
+    incorrectly return 'schedule apartment tour or check availability'.
+    After the fix, only the standalone word 'available' fires the tour branch.
+    """
+    result = triage_message({
+        "sender": "prospect@example.com",
+        "subject": "Unit status",
+        "body": "I was told the unit is currently unavailable. Is anything else open?",
+    })
+    # Must not match the tour/availability branch due to 'unavailable' containing 'available'
+    assert result.extraction.requested_action != "schedule apartment tour or check availability"
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: urgency false positives - conditional high-urgency terms
+# ---------------------------------------------------------------------------
+
+
+
+
+
+def test_urgency_tour_today_is_not_high():
+    """'today' in a routine leasing/tour request must not produce urgency=high.
+
+    Before the fix, 'can I tour today?' was classified high urgency because
+    'today' was an unconditional high-urgency keyword. After the fix, 'today'
+    and 'now' are conditional: they only fire high urgency outside
+    leasing_general so routine scheduling phrases are not treated as
+    emergencies.
+    """
+    result = triage_message({
+        "sender": "prospect@example.com",
+        "subject": "Tour request",
+        "body": "Can I schedule a tour today? I am very interested in the unit.",
+    })
+    assert result.route == "auto_draft"
+    # 'today' in a leasing context must not produce high urgency
+    assert result.extraction.urgency != "high"
+
+
+def test_urgency_today_is_still_high_for_maintenance():
+    """'today' must still produce urgency=high when the message is a maintenance issue.
+
+    This confirms the conditional logic does not suppress urgency for the
+    categories where time pressure genuinely matters.
+    """
+    result = triage_message({
+        "sender": "tenant@example.com",
+        "subject": "No hot water",
+        "body": "There is no hot water in my unit. Please send someone today.",
+    })
+    assert result.route == "human_review"
+    assert result.extraction.urgency == "high"
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: INFO logs must not clutter --report output
+# ---------------------------------------------------------------------------
+
+def test_report_mode_suppresses_info_logs(tmp_path, capsys):
+    """In --report mode the root logger must be raised to WARNING so INFO
+    routing events (routed_to_human_review, routed_to_auto_draft, etc.) do
+    not interleave with the human-readable report on stdout/stderr.
+
+    We write a minimal one-message JSONL file, run main() with --report, then
+    assert that no 'INFO' token appears in the combined output. WARNING and
+    ERROR events are still allowed because those signal real problems.
+    """
+    import logging
+    from triage.runner import main
+
+    # Write a minimal valid JSONL fixture
+    data = tmp_path / "msgs.jsonl"
+    data.write_text(
+        '{"id":"t1","sender":"prospect@example.com","subject":"Parking",'
+        '"body":"Is parking included?","expected_route":"auto_draft"}\n',
+        encoding="utf-8",
+    )
+
+    # Reset root logger level before the call so the test is isolated
+    logging.getLogger().setLevel(logging.INFO)
+
+    main([str(data), "--report"])
+
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    # No INFO-level routing log lines should appear in either stream
+    assert "INFO" not in combined, (
+        "INFO log lines leaked into --report output: " + combined
+    )
+
+
+# ---------------------------------------------------------------------------
+# Product improvement: reviewer_summary field
+# ---------------------------------------------------------------------------
+
+def test_reviewer_summary_high_urgency_maintenance():
+    """High-urgency maintenance message must produce a summary that includes
+    the urgency level, sender type, and unit mention so a reviewer can triage
+    the queue at a glance without opening the original email.
+    """
+    result = triage_message({
+        "sender": "tenant@example.com",
+        "subject": "Flood in bathroom",
+        "body": (
+            "There is a flood in the bathroom right now at Riverside Apartments, "
+            "unit 2A. This is an emergency. Please call me at (555) 308-1247."
+        ),
+    })
+    summary = result.extraction.reviewer_summary
+    assert summary, "reviewer_summary must not be empty"
+    # Summary must surface urgency and sender role
+    assert "High" in summary
+    assert "tenant" in summary
+    # Unit mention must be included in the summary when present
+    assert "unit 2A" in summary or "2A" in summary
+
+def test_reviewer_summary_low_urgency_leasing():
+    """Generic prospect leasing inquiry with no unit or callback must produce
+    a summary that correctly reflects low urgency and reports no contact info,
+    so the reviewer knows immediately this message needs no urgent action.
+    """
+    result = triage_message({
+        "sender": "prospect@example.com",
+        "subject": "Parking question",
+        "body": "Is parking included with the apartment?",
+    })
+    summary = result.extraction.reviewer_summary
+    assert summary, "reviewer_summary must not be empty"
+    assert "Low" in summary
+    assert "prospect" in summary
+    # No unit or callback in this message
+    assert "No unit or callback on file" in summary

@@ -18,6 +18,12 @@
 #    human-readable evaluation report with per-category accuracy, urgency
 #    distribution, unit-mention extraction hit rate, and a safety check
 #    for high-urgency messages that routed to auto_draft.
+#
+# 6. (fix 3) In --report mode the root logger level is raised to WARNING so
+#    INFO routing logs (routed_to_human_review, routed_to_auto_draft, etc.)
+#    do not clutter the human-readable report. WARNING and ERROR events
+#    (bad JSON lines, unexpected triage failures) still print because those
+#    signal real problems the operator needs to see even during a report run.
 # =============================================================================
 
 from __future__ import annotations
@@ -50,6 +56,14 @@ def main(argv: list[str] | None = None) -> int:
     if not path_args:
         print("Error: no data file specified.", file=sys.stderr)
         return 2
+
+    # --- NEW (fix 3): suppress INFO logs in report mode ---
+    # basicConfig sets the root logger to INFO so routing events from core.py
+    # print interleaved with the report output, making it unreadable.
+    # Raising to WARNING keeps the report clean while still surfacing real
+    # problems (skipped lines, triage failures) that the operator needs to see.
+    if report_mode:
+        logging.getLogger().setLevel(logging.WARNING)
     # --- END NEW ---
 
 
@@ -121,6 +135,8 @@ def main(argv: list[str] | None = None) -> int:
                     "unit_mention": ex.unit_mention,
                     "callback_number": ex.callback_number,
                     "property_name": ex.property_name,
+                    # --- NEW (product improvement): plain-English summary ---
+                    "reviewer_summary": ex.reviewer_summary,
                 },
                 # --- END NEW ---
             }, sort_keys=True))
@@ -138,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Correctly routed   : {correct} / {total}")
             print(f"  Overall accuracy   : {accuracy_pct}%")
             print()
+
 
             print("  ACCURACY BY CATEGORY")
             print("  " + "-" * 48)

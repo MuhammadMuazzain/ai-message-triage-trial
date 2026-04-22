@@ -23,6 +23,23 @@
 #    - Non-dict input returns human_review with warning (invalid_message_type).
 #    - subject/body/sender are .strip()ed so whitespace-only strings normalise
 #      to "" and never accidentally match routing or extraction terms.
+#
+# 8. _kw_match() added and used inside _detect_requested_action() so keyword
+#    checks use whole-word \b regex boundaries instead of bare substring `in`.
+#    Fixes false positives where e.g. "please" matched "lease", or
+#    "unavailable" matched "available".
+#
+# 9. _URGENCY_HIGH split into _URGENCY_HIGH_ALWAYS (unconditional, e.g.
+#    "flood", "emergency") and _URGENCY_HIGH_CONDITIONAL ("today", "now").
+#    Conditional terms only trigger high urgency outside leasing_general so
+#    routine phrases like "tour today" are no longer treated as emergencies.
+#    _detect_urgency() gains an optional `category` parameter to apply this.
+#
+# 10. reviewer_summary field added to Extraction: a single plain-English
+#     sentence assembled from already-extracted fields (sender_type, urgency,
+#     category, unit_mention, callback_number). No new extraction logic.
+#     _build_reviewer_summary() generates it inside _extract() after all
+#     other fields are resolved. Only additive, no routing changes.
 # =============================================================================
 
 from __future__ import annotations
@@ -51,6 +68,11 @@ class Extraction:
     # callback_number and property_name complete Isaac's full extraction spec
     callback_number: str | None
     property_name: str | None
+    # --- NEW (product improvement): one-line plain-English summary for the
+    # human review queue, assembled from the already-extracted fields.
+    # Default empty string so the default_factory on TriageResult still works
+    # without any changes to existing return statements.
+    reviewer_summary: str = ""
 # --- END NEW ---
 
 
@@ -84,10 +106,24 @@ MAINTENANCE_TERMS = ("leak", "mold", "no heat", "no hot water", "flood", "electr
 MONEY_TERMS = ("invoice", "payment", "refund", "deposit", "wire", "bank")
 
 # --- NEW: urgency and keyword constants for extraction helpers ---
-_URGENCY_HIGH = (
-    "today", "now", "getting worse", "no heat", "no hot water",
+# --- NEW (fix 2): split _URGENCY_HIGH into two tiers ---
+# _URGENCY_HIGH_ALWAYS: these words signal an emergency in any context and
+#   always produce urgency=high regardless of message category.
+# _URGENCY_HIGH_CONDITIONAL: time-pressure words ("today", "now") that are
+#   genuine emergencies in maintenance/legal contexts but are routine in
+#   leasing_general (e.g. "can I tour today?" is not an emergency).
+#   They only produce urgency=high when category is NOT leasing_general.
+_URGENCY_HIGH_ALWAYS = (
+    "getting worse", "no heat", "no hot water",
     "flood", "flooding", "emergency", "immediately", "urgent",
 )
+_URGENCY_HIGH_CONDITIONAL = (
+    "today", "now",
+)
+# Keep the original name as a combined tuple so any external code that
+# references _URGENCY_HIGH directly still works without breakage.
+_URGENCY_HIGH = _URGENCY_HIGH_ALWAYS + _URGENCY_HIGH_CONDITIONAL
+# --- END NEW ---
 _URGENCY_MEDIUM_TERMS = LEGAL_TERMS + MONEY_TERMS + (
     "complaint", "dispute", "unhappy", "unacceptable",
 )
@@ -227,6 +263,33 @@ def triage_message(message: dict[str, Any]) -> TriageResult:
 
 # --- NEW: _extract() and all helpers below are new; none existed in baseline ---
 
+# --- NEW (product improvement): builds the reviewer_summary from already-
+# resolved extraction fields. Kept separate from _extract() so the logic
+# is easy to read and test in isolation.
+
+def _build_reviewer_summary(
+    sender_type: str,
+    urgency: str,
+    category: str,
+    unit_mention: str | None,
+    callback_number: str | None,
+) -> str:
+    """Return a single plain-English sentence for the human review queue.
+
+    Assembles only from fields already extracted so no additional parsing
+    is needed. Examples:
+      "High-urgency tenant maintenance request for unit 2A. Callback: (555) 308-1247."
+      "Medium-urgency vendor money request. No unit or callback on file."
+      "Low-urgency prospect leasing_general request. No unit or callback on file."
+    """
+    unit_part = f" for {unit_mention}" if unit_mention else ""
+    cb_part = f"Callback: {callback_number}." if callback_number else "No unit or callback on file."
+    return (
+        f"{urgency.capitalize()}-urgency {sender_type} {category} "
+        f"request{unit_part}. {cb_part}"
+    )
+# --- END NEW ---
+
 def _extract(subject: str, body: str, sender: str, category: str) -> Extraction:
     try:
         unit_mention = _extract_unit_mention(subject, body)
@@ -234,13 +297,25 @@ def _extract(subject: str, body: str, sender: str, category: str) -> Extraction:
         # Regex failure must never crash a triage run; log and return None safely
         logger.warning("unit_mention_extract_failed", extra={"message_id": "unknown", "error": str(e)})
         unit_mention = None
+
+    # Resolve all scalar fields first so _build_reviewer_summary can use them
+    sender_type = _detect_sender_type(sender)
+    # --- NEW (fix 2): pass category so conditional urgency terms are
+    # evaluated correctly (e.g. "today" is not high in leasing_general) ---
+    urgency = _detect_urgency(body, subject, category)
+    callback_number = _extract_callback_number(subject, body)
+
     return Extraction(
-        sender_type=_detect_sender_type(sender),
-        urgency=_detect_urgency(body, subject),
+        sender_type=sender_type,
+        urgency=urgency,
         requested_action=_detect_requested_action(subject, body, category),
         unit_mention=unit_mention,
-        callback_number=_extract_callback_number(subject, body),
+        callback_number=callback_number,
         property_name=_extract_property_name(subject, body),
+        # --- NEW (product improvement): assembled last, after all fields resolved ---
+        reviewer_summary=_build_reviewer_summary(
+            sender_type, urgency, category, unit_mention, callback_number
+        ),
     )
 
 
@@ -257,14 +332,38 @@ def _detect_sender_type(sender: str) -> str:
     return "unknown"
 
 
-def _detect_urgency(body: str, subject: str = "") -> str:
+def _detect_urgency(body: str, subject: str = "", category: str = "") -> str:
     # Subject is included so that "No heat" in the subject line alone triggers high urgency
     text = f"{subject}\n{body}".lower()
-    if any(re.search(rf"\b{re.escape(t)}\b", text) for t in _URGENCY_HIGH):
+
+    # --- NEW (fix 2): two-tier urgency check ---
+    # Tier 1: unconditional high-urgency terms fire regardless of category.
+    if any(re.search(rf"\b{re.escape(t)}\b", text) for t in _URGENCY_HIGH_ALWAYS):
         return "high"
+    # Tier 2: conditional terms ("today", "now") only count as high urgency
+    # when the category is not leasing_general. A prospect asking to tour
+    # "today" or a lease question mentioning "now" is routine, not an
+    # emergency. In maintenance, legal, or money contexts these words do
+    # signal time pressure and should still produce urgency=high.
+    if category != "leasing_general":
+        if any(re.search(rf"\b{re.escape(t)}\b", text) for t in _URGENCY_HIGH_CONDITIONAL):
+            return "high"
+    # --- END NEW ---
+
     if any(re.search(rf"\b{re.escape(t)}\b", text) for t in _URGENCY_MEDIUM_TERMS):
         return "medium"
     return "low"
+
+
+# --- NEW (fix 1): whole-word keyword matcher ---
+# Bare substring `in` checks caused false positives: "please" matched "lease",
+# "unavailable" matched "available", "reapply" matched "apply", etc.
+# _kw_match() uses \b word-boundary regex so only complete words fire.
+# re is already imported; no new dependency needed.
+def _kw_match(text: str, keywords: tuple) -> bool:
+    """Return True if any keyword matches as a complete word in text."""
+    return any(re.search(rf"\b{re.escape(kw)}\b", text) for kw in keywords)
+# --- END NEW ---
 
 
 def _detect_requested_action(subject: str, body: str, category: str) -> str:
@@ -282,14 +381,16 @@ def _detect_requested_action(subject: str, body: str, category: str) -> str:
         return "review automated leasing or system summary"
 
     if category == "leasing_general":
-        if any(kw in text for kw in _TOUR_KEYWORDS):
+        # --- NEW (fix 1): replaced bare `in` with _kw_match() for whole-word safety ---
+        if _kw_match(text, _TOUR_KEYWORDS):
             return "schedule apartment tour or check availability"
-        if any(kw in text for kw in _APPLICATION_KEYWORDS):
+        if _kw_match(text, _APPLICATION_KEYWORDS):
             return "acknowledge application submitted wait next steps"
-        if any(kw in text for kw in _AMENITY_KEYWORDS):
+        if _kw_match(text, _AMENITY_KEYWORDS):
             return "ask building amenities parking or services"
-        if any(kw in text for kw in _LEASE_KEYWORDS):
+        if _kw_match(text, _LEASE_KEYWORDS):
             return "ask about lease term renewal or dates"
+        # --- END NEW ---
 
     return "general property management inquiry"
 
